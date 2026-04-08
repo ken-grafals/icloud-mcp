@@ -443,6 +443,33 @@ async def email_send(
 
 
 @mcp.tool()
+async def email_reply(
+    context,
+    message_id: str,
+    body: str,
+    folder: str = "INBOX",
+    reply_all: bool = False,
+    html: bool = False
+) -> dict:
+    """
+    Reply to an email message with quoted original text and proper threading headers.
+
+    Args:
+        message_id: Message ID (IMAP UID) of the message to reply to
+        body: Reply body content
+        folder: Folder containing the original message (default: INBOX)
+        reply_all: Reply to all recipients (default: False)
+        html: Whether body is HTML (default: False)
+    """
+    try:
+        return await email_module.reply_message(context, message_id, body, folder, reply_all, html)
+    except AuthenticationError as e:
+        return {"error": str(e), "status": 401}
+    except Exception as e:
+        return {"error": str(e), "status": 500}
+
+
+@mcp.tool()
 async def email_move(
     context,
     message_id: str,

@@ -252,6 +252,7 @@ async def get_message(
 
         result = {
             "id": message_id,
+            "message_id_header": msg.get('Message-ID', ''),
             "subject": _decode_mime_header(msg.get('Subject', '')),
             "from": _decode_mime_header(msg.get('From', '')),
             "to": _decode_mime_header(msg.get('To', '')),
@@ -663,6 +664,172 @@ async def send_message(
     return {
         "status": "success",
         "message": f"Email sent to {to}"
+    }
+
+
+async def reply_message(
+    context: Context,
+    message_id: str,
+    body: str,
+    folder: str = "INBOX",
+    reply_all: bool = False,
+    html: bool = False
+) -> Dict[str, str]:
+    """
+    Reply to an email message, including quoted original text and proper threading headers.
+
+    Args:
+        message_id: Message ID (IMAP UID) of the message to reply to
+        body: Reply body content
+        folder: Folder containing the original message (default: INBOX)
+        reply_all: Reply to all recipients (default: False)
+        html: Whether body is HTML (default: False)
+
+    Returns:
+        Confirmation message
+    """
+    username, password = require_auth(context)
+
+    # Fetch the original message
+    client = _get_imap_client(username, password)
+    try:
+        client.select_folder(folder)
+        msg_id = int(message_id)
+
+        response = client.fetch([msg_id], [b'BODY.PEEK[]'])
+        if msg_id not in response:
+            raise ValueError(f"Message {message_id} not found in {folder}")
+
+        data = response[msg_id]
+        raw_email = None
+        for key in [b'BODY[]', 'BODY[]', b'RFC822', 'RFC822', b'BODY.PEEK[]']:
+            if key in data:
+                raw_email = data[key]
+                break
+
+        if raw_email is None:
+            raise KeyError(f"Message body not found for message {message_id}")
+
+        original = email.message_from_bytes(raw_email)
+    finally:
+        _close_imap_client(client)
+
+    # Extract original message details
+    orig_from = _decode_mime_header(original.get('From', ''))
+    orig_to = _decode_mime_header(original.get('To', ''))
+    orig_cc = _decode_mime_header(original.get('Cc', ''))
+    orig_subject = _decode_mime_header(original.get('Subject', ''))
+    orig_date = original.get('Date', '')
+    orig_message_id = original.get('Message-ID', '')
+    orig_references = original.get('References', '')
+
+    # Extract original plain-text body for quoting
+    orig_body_text = ""
+    if original.is_multipart():
+        for part in original.walk():
+            if part.get_content_type() == "text/plain":
+                try:
+                    orig_body_text = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    break
+                except Exception:
+                    pass
+    else:
+        try:
+            orig_body_text = original.get_payload(decode=True).decode('utf-8', errors='ignore')
+        except Exception:
+            pass
+
+    # Build subject
+    reply_subject = orig_subject
+    if not reply_subject.lower().startswith('re:'):
+        reply_subject = f"Re: {reply_subject}"
+
+    # Build quoted body
+    quoted_lines = "\n".join(f"> {line}" for line in orig_body_text.splitlines())
+    full_body = f"{body}\n\nOn {orig_date}, {orig_from} wrote:\n{quoted_lines}"
+
+    # Build recipients
+    reply_to = orig_from
+    reply_cc = None
+    if reply_all:
+        # Collect all original recipients, excluding self
+        all_addrs = set()
+        for addr_str in [orig_to, orig_cc]:
+            if addr_str:
+                for addr in addr_str.split(','):
+                    addr = addr.strip()
+                    if addr and username.lower() not in addr.lower():
+                        all_addrs.add(addr)
+        # Remove the person we're replying to (already in To)
+        all_addrs.discard(orig_from.strip())
+        if all_addrs:
+            reply_cc = ', '.join(all_addrs)
+
+    # Build References header (append original Message-ID to existing chain)
+    references = orig_references
+    if orig_message_id:
+        if references:
+            references = f"{references} {orig_message_id}"
+        else:
+            references = orig_message_id
+
+    # Create message
+    if html:
+        msg = MIMEMultipart('alternative')
+        msg.attach(MIMEText(full_body, 'html'))
+    else:
+        msg = MIMEText(full_body)
+
+    msg['From'] = username
+    msg['To'] = reply_to
+    msg['Subject'] = reply_subject
+    if reply_cc:
+        msg['Cc'] = reply_cc
+    if orig_message_id:
+        msg['In-Reply-To'] = orig_message_id
+    if references:
+        msg['References'] = references
+
+    # Send via SMTP
+    with _get_smtp_client(username, password) as smtp_client:
+        recipients = [reply_to]
+        if reply_cc:
+            recipients.extend([addr.strip() for addr in reply_cc.split(',')])
+        smtp_client.send_message(msg, from_addr=username, to_addrs=recipients)
+
+    # Save copy to Sent folder via IMAP
+    imap_client = None
+    try:
+        imap_client = _get_imap_client(username, password)
+
+        if 'Date' not in msg:
+            from email.utils import formatdate
+            msg['Date'] = formatdate(localtime=True)
+
+        msg_bytes = msg.as_bytes()
+
+        try:
+            imap_client.append(config.SENT_FOLDER, msg_bytes, flags=['\\Seen'])
+        except Exception as e:
+            for folder_name in ['Sent', 'Sent Items', config.SENT_FOLDER]:
+                try:
+                    imap_client.append(folder_name, msg_bytes, flags=['\\Seen'])
+                    break
+                except Exception:
+                    continue
+            else:
+                logger.error(f"Could not save to Sent folder: {e}")
+
+    except Exception as e:
+        logger.error(f"Error saving to Sent folder: {e}")
+
+    finally:
+        if imap_client:
+            _close_imap_client(imap_client)
+
+    return {
+        "status": "success",
+        "message": f"Reply sent to {reply_to}"
     }
 
 
